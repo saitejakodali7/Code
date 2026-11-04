@@ -1,0 +1,448 @@
+' Extender: BuildMMRptgClone
+' Prepared for OneStream 9.2.1.18605. Not compiled against OneStream assemblies.
+' Generates a native XML clone package; NEVER imports it or saves metadata.
+Imports System
+Imports System.IO
+Imports System.Linq
+Imports System.Text
+Imports System.Xml.Linq
+Imports System.Collections.Generic
+Imports OneStream.Shared.Common
+Imports OneStream.Shared.Wcf
+Imports OneStream.Shared.Engine
+Imports OneStream.Shared.Database
+Imports OneStream.Finance.Engine
+Imports OneStream.Finance.Database
+Imports OneStream.Stage.Engine
+Imports OneStream.Stage.Database
+
+Namespace OneStream.BusinessRule.Extender.BuildMMRptgClone
+
+    Public Class MainClass
+        Public Function Main(ByVal si As SessionInfo, ByVal globals As BRGlobals,
+                             ByVal api As Object, ByVal args As ExtenderArgs) As Object
+            Try
+                ' Exact MEMBER names, not descriptions shown by a display option.
+                Const SourceRoot As String = "Market Management Reporting"
+                Const Destination As String = "Alternate Reporting Hierarchies"
+                Const NewRoot As String = "Market_Management_Reporting_Rptg"
+                Const Suffix As String = "Rptg"
+
+                ' Preserve parent/relationship ownership along this existing chain.
+                Dim chain As String() = {"RootAccountDim", "MM_LRPAccounts",
+                    "MM_PlanningAccounts", "PlanningAccounts", "DetailActAccounts"}
+
+                ' The new root's contribution to the organizational container.
+                ' 1D is the normal new relationship weight. The report flags a
+                ' non-Group container because adding the hierarchy could then
+                ' change totals above that container. Review before loading.
+                Dim attachmentWeight As Nullable(Of Decimal) = 1D
+
+                ' Export every Account dimension to check names/aliases globally.
+                ' No cube data is read or exported.
+                Dim extractOptions As New XmlExtractOptions
+                extractOptions.ExtractAllItems = False
+                Dim selected As New Dictionary(Of XmlExtractItemPk, Boolean)
+                selected.Add(New XmlExtractItemPk(XmlExtractItemType.Dimensions), True)
+                Dim metadataOptions As New XmlExtractMetadataOptions
+
+                For Each accountDim In BRApi.Finance.Dim.GetDims(si, DimType.Account.Id)
+                    Dim dimId As Integer = accountDim.DimPk.DimId
+                    selected.Add(New XmlExtractItemPk(XmlExtractItemType.Dimension, dimId), True)
+                    Dim dimOptions As New XmlExtractMetadataDimOptions
+                    dimOptions.ExtractAllMembers = True
+                    dimOptions.ExtractAllRelationships = True
+                    dimOptions.ExtractMembersForEachSelectedRelationship = False
+                    metadataOptions.SetOptionsForDimension(DimType.Account.Id, dimId, dimOptions)
+                Next
+                extractOptions.MetadataOptions = metadataOptions
+
+                Dim sourceXml As String
+                Using dbConnFW As DbConnInfo = BRApi.Database.CreateFrameworkDbConnInfo(si)
+                    Using dbConnApp As DbConnInfo = BRApi.Database.CreateApplicationDbConnInfo(si)
+                        sourceXml = MetadataExtract.ExtractXml(dbConnFW, dbConnApp, extractOptions, selected)
+                    End Using
+                End Using
+
+                Dim folder As String = Path.Combine(
+                    FileShareFolderHelper.GetDataManagementExportUsernameFolderForApp(
+                        si, True, AppServerConfig.GetSettings(si).FileShareRootFolder,
+                        si.AppToken.AppName),
+                    "MMRptgClone", DateTime.UtcNow.ToString("yyyyMMdd_HHmmss") & "_" &
+                    Guid.NewGuid().ToString("N").Substring(0, 8))
+                Directory.CreateDirectory(folder)
+                File.WriteAllText(Path.Combine(folder, "01_Source_Account_Metadata.xml"),
+                                  sourceXml, New UTF8Encoding(False))
+
+                Dim result As ClonePackage = CloneBuilder.Build(
+                    XDocument.Parse(sourceXml), chain, SourceRoot, Destination,
+                    NewRoot, Suffix, attachmentWeight, "9.2.1")
+
+                ' Also recheck target member names against live metadata.
+                For Each targetName As String In result.NewNames
+                    If BRApi.Finance.Members.GetMemberId(si, DimType.Account.Id, targetName) <>
+                       DimConstants.Unknown Then
+                        Throw New Exception("Target already exists: " & targetName &
+                            ". Removing a relationship does not delete its member.")
+                    End If
+                Next
+
+                File.WriteAllText(Path.Combine(folder, "02_Mapping.csv"), result.MappingCsv,
+                                  New UTF8Encoding(True))
+                File.WriteAllText(Path.Combine(folder, "03_Review.txt"), result.Report,
+                                  New UTF8Encoding(False))
+
+                Dim outputName As String = If(result.ReviewIssues.Count = 0,
+                    "04_Clone_REVIEW_BEFORE_LOAD.xml", "04_Clone_DRAFT_DO_NOT_LOAD.xml.txt")
+                result.Document.Save(Path.Combine(folder, outputName))
+
+                BRApi.ErrorLog.LogMessage(si, result.Report & Environment.NewLine &
+                    "Files: " & folder & Environment.NewLine &
+                    "No member or relationship changes have been applied.")
+                Return Nothing
+            Catch ex As Exception
+                Throw ErrorHandler.LogWrite(si, New XFException(si, ex))
+            End Try
+        End Function
+    End Class
+
+    ' XML transformation below uses only .NET. Native member/relationship XML
+    ' is copied in full, rather than assigning default Account properties.
+    Public Class ClonePackage
+        Public Document As XDocument
+        Public MappingCsv As String
+        Public Report As String
+        Public NewNames As New List(Of String)
+        Public ReviewIssues As New List(Of String)
+    End Class
+
+    Public Class CloneBuilder
+        Private Shared ReadOnly CI As StringComparer = StringComparer.OrdinalIgnoreCase
+
+        Public Shared Function Build(ByVal input As XDocument, ByVal chain As String(),
+            ByVal sourceRoot As String, ByVal destination As String, ByVal newRoot As String,
+            ByVal suffix As String, ByVal attachmentWeight As Nullable(Of Decimal),
+            ByVal versionPrefix As String) As ClonePackage
+
+            If chain Is Nothing OrElse chain.Length < 2 Then Fail("Configure the dimension chain.")
+            If String.IsNullOrWhiteSpace(suffix) Then Fail("Suffix must not be empty.")
+            If input.Root Is Nothing OrElse input.Root.Name <> XName.Get("OneStreamXF") Then
+                Fail("Unexpected native metadata XML root or namespace.")
+            End If
+            Dim exportedVersion As String = CStr(input.Root.Attribute("version"))
+            If String.IsNullOrEmpty(exportedVersion) OrElse
+               Not exportedVersion.StartsWith(versionPrefix & ".", StringComparison.OrdinalIgnoreCase) Then
+                Fail("Expected a " & versionPrefix & " native export; found " & exportedVersion)
+            End If
+            Dim metadata As XElement = input.Root.Element("metadataRoot")
+            If metadata Is Nothing Then Fail("No native metadataRoot section found.")
+            Dim dimensions As XElement = metadata.Element("dimensions")
+            If dimensions Is Nothing Then Fail("No native dimensions section found.")
+            If input.Descendants().Attributes("action").Any() Then
+                Fail("Use a full current export, without action/delete instructions.")
+            End If
+
+            Dim dims As New Dictionary(Of String, XElement)(CI)
+            Dim members As New Dictionary(Of String, XElement)(CI)
+            Dim owners As New Dictionary(Of String, String)(CI)
+            Dim reserved As New HashSet(Of String)(CI)
+            For Each dimNode As XElement In dimensions.Elements("dimension")
+                If Not CI.Equals(Required(dimNode, "type"), "Account") Then Continue For
+                Dim dimName As String = Required(dimNode, "name")
+                dims.Add(dimName, dimNode)
+                For Each memberNode As XElement In Section(dimNode, "members").Elements("member")
+                    Dim memberName As String = Required(memberNode, "name")
+                    If memberNode.Descendants().Any(Function(e) e.Name.LocalName.IndexOf("alias", StringComparison.OrdinalIgnoreCase) >= 0) OrElse
+                       memberNode.Attributes().Any(Function(a) a.Name.LocalName.IndexOf("alias", StringComparison.OrdinalIgnoreCase) >= 0 AndAlso Not IsAlias(a.Name.LocalName)) Then
+                        Fail("Unrecognized alias representation on " & memberName & "; inspect the 9.2.1 schema before checking global collisions.")
+                    End If
+                    If members.ContainsKey(memberName) Then Fail("Duplicate member definition: " & memberName)
+                    members.Add(memberName, memberNode)
+                    owners.Add(memberName, dimName)
+                    reserved.Add(memberName)
+                    For Each a As XAttribute In memberNode.Attributes()
+                        If IsAlias(a.Name.LocalName) Then AddAliases(reserved, a.Value)
+                    Next
+                    For Each p As XElement In memberNode.Descendants("property")
+                        Dim propertyName As String = CStr(p.Attribute("name"))
+                        If IsAlias(propertyName) Then
+                            AddAliases(reserved, CStr(p.Attribute("value")))
+                        ElseIf propertyName IsNot Nothing AndAlso
+                               propertyName.IndexOf("alias", StringComparison.OrdinalIgnoreCase) >= 0 Then
+                            Fail("Unrecognized alias property on " & memberName & "; inspect the 9.2.1 schema before checking global collisions.")
+                        End If
+                    Next
+                Next
+            Next
+            For i As Integer = 0 To chain.Length - 1
+                If Not dims.ContainsKey(chain(i)) Then Fail("Dimension missing from export: " & chain(i))
+                Dim sourceType As String = CStr(dims(chain(i)).Attribute("dimMemberSourceType"))
+                If Not String.IsNullOrEmpty(sourceType) AndAlso Not CI.Equals(sourceType, "Standard") Then
+                    Fail("Only Standard dimensions are supported: " & chain(i))
+                End If
+                If i > 0 AndAlso Not CI.Equals(CStr(dims(chain(i)).Attribute("inheritedDim")), chain(i - 1)) Then
+                    Fail("Unexpected inheritance for " & chain(i) & ". Check chain configuration.")
+                End If
+            Next
+            If Not members.ContainsKey(sourceRoot) Then Fail("Source MEMBER name not found: " & sourceRoot)
+            If Not members.ContainsKey(destination) Then Fail("Destination MEMBER name not found: " & destination)
+            If Not CI.Equals(owners(sourceRoot), chain(1)) OrElse Not CI.Equals(owners(destination), chain(1)) Then
+                Fail("This configuration expects source and destination roots to be owned by " & chain(1))
+            End If
+
+            Dim edges As New List(Of XElement)
+            Dim edgeOwners As New Dictionary(Of XElement, String)
+            Dim adjacency As New Dictionary(Of String, List(Of String))(CI)
+            For Each dimName As String In chain
+                Dim keys As New HashSet(Of String)(CI)
+                For Each edge As XElement In Section(dims(dimName), "relationships").Elements("relationship")
+                    Dim parent As String = Required(edge, "parent")
+                    Dim child As String = Required(edge, "child")
+                    If Not keys.Add(parent & ChrW(0) & child) Then Fail("Duplicate relationship in " & dimName)
+                    edges.Add(edge)
+                    edgeOwners.Add(edge, dimName)
+                    If Not adjacency.ContainsKey(parent) Then adjacency.Add(parent, New List(Of String))
+                    adjacency(parent).Add(child)
+                Next
+            Next
+            Dim branch As HashSet(Of String) = Reachable(sourceRoot, adjacency)
+            If branch.Count < 2 Then Fail("Source hierarchy contains no descendants.")
+            If branch.Contains(destination) Then Fail("Destination is inside the source branch.")
+            If adjacency.ContainsKey(destination) AndAlso adjacency(destination).Count > 0 Then
+                Fail("Destination still has children in the configured dimension chain.")
+            End If
+            CheckCycles(sourceRoot, adjacency, New HashSet(Of String)(CI), New HashSet(Of String)(CI), 0)
+
+            Dim rename As New Dictionary(Of String, String)(CI)
+            Dim proposed As New HashSet(Of String)(CI)
+            For Each oldName As String In branch.OrderBy(Function(n) n, CI)
+                If Not members.ContainsKey(oldName) Then Fail("Member definition missing: " & oldName)
+                If Not adjacency.ContainsKey(oldName) AndAlso Not CI.Equals(oldName, sourceRoot) Then Continue For
+                If Not chain.Skip(1).Contains(owners(oldName), CI) Then
+                    Fail("Parent is owned outside the four configured business dimensions: " & oldName)
+                End If
+                Dim target As String = If(CI.Equals(oldName, sourceRoot), newRoot, oldName & suffix)
+                If String.IsNullOrWhiteSpace(target) OrElse target.Length > 500 Then Fail("Invalid target name: " & target)
+                If reserved.Contains(target) OrElse Not proposed.Add(target) Then
+                    Fail("Target member name/alias already exists or is duplicated: " & target)
+                End If
+                rename.Add(oldName, target)
+            Next
+
+            Dim result As New ClonePackage
+            Dim report As New StringBuilder
+            Dim mapping As New StringBuilder("Source,NewMember,OwningDimension" & Environment.NewLine)
+            report.AppendLine("MM reporting hierarchy clone package; native export version " & exportedVersion)
+            report.AppendLine("Source: " & sourceRoot & "; destination: " & destination)
+            report.AppendLine("New root: " & newRoot & "; parent suffix: " & suffix)
+            report.AppendLine("Stored cube data is not copied. Existing detail member IDs are reused.")
+            report.AppendLine("Dimension wrapper settings are retained from the snapshot; check for concurrent changes before load.")
+            report.AppendLine("The destination receives a new child; that attachment is visible wherever the destination is shared or inherited.")
+            report.AppendLine("The source snapshot contains all Account dimensions, including their metadata properties and formulas.")
+
+            ' Copy wrapper attributes/properties from the CURRENT native export.
+            Dim outputRoot As New XElement(input.Root.Name, input.Root.Attributes())
+            Dim outputDims As New XElement("dimensions")
+            Dim outputMetadata As New XElement("metadataRoot", outputDims)
+            outputRoot.Add(outputMetadata)
+            result.Document = New XDocument(New XDeclaration("1.0", "utf-8", Nothing), outputRoot)
+            Dim outputDimIndex As New Dictionary(Of String, XElement)(CI)
+            For Each dimName As String In chain.Skip(1)
+                Dim src As XElement = dims(dimName)
+                Dim outputDim As New XElement("dimension", src.Attributes())
+                If src.Element("properties") IsNot Nothing Then outputDim.Add(New XElement(src.Element("properties")))
+                outputDim.Add(New XElement("members"), New XElement("relationships"))
+                outputDimIndex.Add(dimName, outputDim)
+            Next
+            For Each item As KeyValuePair(Of String, String) In rename
+                Dim copy As New XElement(members(item.Key))
+                CheckIdentity(copy)
+                copy.SetAttributeValue("name", item.Value)
+                ' Aliases of the originals cannot be reused by the clones.
+                For Each aliasAttribute As XAttribute In copy.Attributes().Where(Function(a) IsAlias(a.Name.LocalName)).ToList()
+                    aliasAttribute.Value = ""
+                Next
+                If copy.Descendants().Any(Function(e) IsAlias(e.Name.LocalName)) Then
+                    Fail("Alias elements need schema review before cloning: " & item.Key)
+                End If
+                For Each prop As XElement In copy.Descendants("property")
+                    Dim propName As String = CStr(prop.Attribute("name"))
+                    Dim value As String = CStr(prop.Attribute("value"))
+                    If IsAlias(propName) Then prop.SetAttributeValue("value", "")
+                    If propName IsNot Nothing AndAlso propName.IndexOf("Formula", StringComparison.OrdinalIgnoreCase) >= 0 AndAlso
+                       Not String.IsNullOrWhiteSpace(value) AndAlso Not CI.Equals(value, "None") Then
+                        result.ReviewIssues.Add("Formula review: " & item.Key & " / " & propName &
+                            ". Formula text/types are preserved, references are not rewritten.")
+                    End If
+                    If CI.Equals(propName, "PlugAccount") AndAlso Not String.IsNullOrEmpty(value) AndAlso
+                       rename.ContainsKey(value) Then
+                        result.ReviewIssues.Add("Review PlugAccount reference: " & item.Key & " -> " & value)
+                    End If
+                Next
+                outputDimIndex(owners(item.Key)).Element("members").Add(copy)
+                result.NewNames.Add(item.Value)
+                mapping.AppendLine(Csv(item.Key) & "," & Csv(item.Value) & "," & Csv(owners(item.Key)))
+            Next
+
+            Dim edgeCount As Integer = 0
+            For Each edge As XElement In edges
+                Dim parent As String = Required(edge, "parent")
+                If Not rename.ContainsKey(parent) Then Continue For
+                Dim child As String = Required(edge, "child")
+                Dim copy As New XElement(edge)
+                CheckIdentity(copy)
+                copy.SetAttributeValue("parent", rename(parent))
+                If rename.ContainsKey(child) Then copy.SetAttributeValue("child", rename(child))
+                outputDimIndex(edgeOwners(edge)).Element("relationships").Add(copy)
+                edgeCount += 1
+            Next
+
+            ' Add one explicit new attachment. It has no original edge to copy.
+            If Not attachmentWeight.HasValue Then
+                result.ReviewIssues.Add("Choose the aggregation weight for destination -> new root after reviewing the container account type.")
+            Else
+                outputDimIndex(owners(sourceRoot)).Element("relationships").Add(
+                    New XElement("relationship", New XAttribute("parent", destination),
+                        New XAttribute("child", newRoot), New XAttribute("aggregationWeight",
+                            attachmentWeight.Value.ToString(System.Globalization.CultureInfo.InvariantCulture))))
+                If attachmentWeight.Value <> 0D AndAlso Not CI.Equals(AccountTypeOf(members(destination)), "Group") Then
+                    result.ReviewIssues.Add("Destination is not explicitly AccountType Group; review the new attachment's effect on ancestor totals.")
+                End If
+            End If
+
+            ' Diagnose summary-input accounts: a leaf in one effective view can
+            ' become a parent in another view. Their stored values do NOT move.
+            Dim effective As New Dictionary(Of String, List(Of String))(CI)
+            For Each dimName As String In chain
+                For Each edge As XElement In Section(dims(dimName), "relationships").Elements("relationship")
+                    Dim p As String = Required(edge, "parent")
+                    If Not effective.ContainsKey(p) Then effective.Add(p, New List(Of String))
+                    effective(p).Add(Required(edge, "child"))
+                Next
+                If CI.Equals(dimName, chain(0)) Then Continue For
+                Dim visible As HashSet(Of String) = Reachable(sourceRoot, effective)
+                For Each oldName As String In rename.Keys
+                    If visible.Contains(oldName) AndAlso Not effective.ContainsKey(oldName) Then
+                        result.ReviewIssues.Add("Summary-input design review: " & oldName & " is a base member in " & dimName &
+                            " but a parent in a lower dimension. New IDs do not carry its stored data.")
+                    End If
+                Next
+            Next
+            For Each dimName As String In chain.Skip(1)
+                Dim node As XElement = outputDimIndex(dimName)
+                If node.Element("members").HasElements OrElse node.Element("relationships").HasElements Then outputDims.Add(node)
+            Next
+            report.AppendLine("New member definitions: " & rename.Count.ToString())
+            report.AppendLine("Copied internal relationships: " & edgeCount.ToString())
+            report.AppendLine("Reused detail accounts: " & (branch.Count - rename.Count).ToString())
+            report.AppendLine("Destination AccountType: " & AccountTypeOf(members(destination)))
+            report.AppendLine("Review issues: " & result.ReviewIssues.Count.ToString())
+            For Each issue As String In result.ReviewIssues.Distinct(CI)
+                report.AppendLine("REVIEW REQUIRED: " & issue)
+            Next
+            report.AppendLine("No original member definitions or original parent-child edges are included in the clone sections.")
+            report.AppendLine("No import is performed. Inspect all files and validate in a test application before loading.")
+            result.Report = report.ToString()
+            result.MappingCsv = mapping.ToString()
+            Return result
+        End Function
+
+        Private Shared Function Section(ByVal parent As XElement, ByVal name As String) As XElement
+            Dim found As XElement = parent.Element(name)
+            If found Is Nothing Then Fail("Missing native XML section " & name & " in " & CStr(parent.Attribute("name")))
+            Return found
+        End Function
+
+        Private Shared Function Required(ByVal node As XElement, ByVal name As String) As String
+            Dim value As String = CStr(node.Attribute(name))
+            If String.IsNullOrWhiteSpace(value) Then Fail("Missing " & name & " on " & node.Name.LocalName)
+            Return value
+        End Function
+
+        Private Shared Function Reachable(ByVal root As String,
+            ByVal adjacency As Dictionary(Of String, List(Of String))) As HashSet(Of String)
+            Dim seen As New HashSet(Of String)(CI)
+            Dim queue As New Queue(Of String)
+            queue.Enqueue(root)
+            While queue.Count > 0
+                Dim current As String = queue.Dequeue()
+                If Not seen.Add(current) Then Continue While
+                If adjacency.ContainsKey(current) Then
+                    For Each child As String In adjacency(current)
+                        queue.Enqueue(child)
+                    Next
+                End If
+            End While
+            Return seen
+        End Function
+
+        Private Shared Sub CheckCycles(ByVal current As String,
+            ByVal adjacency As Dictionary(Of String, List(Of String)),
+            ByVal visiting As HashSet(Of String), ByVal done As HashSet(Of String), ByVal depth As Integer)
+            If depth > 500 Then Fail("Hierarchy exceeds 500 levels.")
+            If visiting.Contains(current) Then Fail("Cycle in source hierarchy: " & current)
+            If done.Contains(current) Then Return
+            visiting.Add(current)
+            If adjacency.ContainsKey(current) Then
+                For Each child As String In adjacency(current)
+                    CheckCycles(child, adjacency, visiting, done, depth + 1)
+                Next
+            End If
+            visiting.Remove(current)
+            done.Add(current)
+        End Sub
+
+        Private Shared Sub CheckIdentity(ByVal node As XElement)
+            Dim allowed As String()
+            If node.Name.LocalName = "member" Then
+                allowed = {"name", "description", "displayMemberGroup", "alias", "aliases"}
+            Else
+                allowed = {"parent", "child", "aggregationWeight", "siblingSortOrder", "parentSortOrder"}
+            End If
+            If node.Attributes().Any(Function(a) Not allowed.Contains(a.Name.LocalName, CI)) Then
+                Fail("Unrecognized attribute on " & node.Name.LocalName & "; inspect the 9.2.1 export schema before cloning.")
+            End If
+            For Each element As XElement In node.DescendantsAndSelf()
+                For Each a As XAttribute In element.Attributes()
+                    Dim name As String = a.Name.LocalName
+                    If name.EndsWith("Id", StringComparison.OrdinalIgnoreCase) OrElse
+                       name.EndsWith("Pk", StringComparison.OrdinalIgnoreCase) OrElse
+                       (name.IndexOf("alias", StringComparison.OrdinalIgnoreCase) >= 0 AndAlso Not IsAlias(name)) Then
+                        Fail("Unrecognized identity/alias attribute " & name & "; inspect the export schema before cloning.")
+                    End If
+                Next
+                If element IsNot node AndAlso
+                   (element.Name.LocalName.EndsWith("Id", StringComparison.OrdinalIgnoreCase) OrElse
+                    element.Name.LocalName.EndsWith("Pk", StringComparison.OrdinalIgnoreCase) OrElse
+                    element.Name.LocalName.IndexOf("alias", StringComparison.OrdinalIgnoreCase) >= 0) Then
+                    Fail("Unrecognized identity/alias element in " & node.Name.LocalName & "; inspect the export schema before cloning.")
+                End If
+            Next
+        End Sub
+
+        Private Shared Function AccountTypeOf(ByVal member As XElement) As String
+            Dim prop As XElement = member.Descendants("property").FirstOrDefault(
+                Function(p) CI.Equals(CStr(p.Attribute("name")), "AccountType"))
+            Return If(prop Is Nothing, "not explicitly exported", CStr(prop.Attribute("value")))
+        End Function
+
+        Private Shared Function IsAlias(ByVal name As String) As Boolean
+            Return CI.Equals(name, "Alias") OrElse CI.Equals(name, "Aliases")
+        End Function
+
+        Private Shared Sub AddAliases(ByVal reserved As HashSet(Of String), ByVal aliases As String)
+            If String.IsNullOrWhiteSpace(aliases) Then Return
+            For Each aliasName As String In aliases.Split(","c)
+                If aliasName.Trim().Length > 0 Then reserved.Add(aliasName.Trim())
+            Next
+        End Sub
+
+        Private Shared Function Csv(ByVal value As String) As String
+            Return """" & value.Replace("""", """""") & """"
+        End Function
+
+        Private Shared Sub Fail(ByVal message As String)
+            Throw New InvalidOperationException(message)
+        End Sub
+    End Class
+End Namespace
