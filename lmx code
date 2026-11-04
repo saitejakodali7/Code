@@ -1,13 +1,12 @@
 ' Extender: BuildMMRptgClone
 ' Prepared for OneStream 9.2.1.18605. Not compiled against OneStream assemblies.
 ' Revision 1: permits the built-in RootAccountDim to be absent from native XML.
-' Revision 2: also generates a separate Excel review snapshot.
+' Final output: clone XML and one expandable hierarchy review file only.
 ' Generates a native XML clone package; NEVER imports it or saves metadata.
 Imports System
 Imports System.IO
 Imports System.Globalization
 Imports System.Xml
-Imports System.IO.Compression
 Imports System.Linq
 Imports System.Text
 Imports System.Xml.Linq
@@ -69,17 +68,6 @@ Namespace OneStream.BusinessRule.Extender.BuildMMRptgClone
                     End Using
                 End Using
 
-                Dim folder As String = Path.Combine(
-                    FileShareFolderHelper.GetDataManagementExportUsernameFolderForApp(
-                        si, True, AppServerConfig.GetSettings(si).FileShareRootFolder,
-                        si.AppToken.AppName),
-                    "MMRptgClone", DateTime.UtcNow.ToString("yyyyMMdd_HHmmss") & "_" &
-                    Guid.NewGuid().ToString("N").Substring(0, 8))
-                Directory.CreateDirectory(folder)
-                File.WriteAllText(Path.Combine(folder, "01_Source_Account_Metadata.xml"),
-                                  sourceXml, New UTF8Encoding(False))
-                BRApi.ErrorLog.LogMessage(si, "MMRptgClone source snapshot saved. Files: " & folder)
-
                 Dim sourceDocument As XDocument = XDocument.Parse(sourceXml)
                 Dim result As ClonePackage = CloneBuilder.Build(
                     sourceDocument, chain, SourceRoot, Destination,
@@ -94,23 +82,30 @@ Namespace OneStream.BusinessRule.Extender.BuildMMRptgClone
                     End If
                 Next
 
-                File.WriteAllText(Path.Combine(folder, "02_Mapping.csv"), result.MappingCsv,
-                                  New UTF8Encoding(True))
-                File.WriteAllText(Path.Combine(folder, "03_Review.txt"), result.Report,
-                                  New UTF8Encoding(False))
+                ' Generate only these two output files. Read the visual review
+                ' before importing XML, especially if review issues are present.
+                Const XmlFileName As String = "MMRptg_Clone.xml"
+                Const ReviewFileName As String = "MMRptg_Hierarchy_Review.html"
+                result.Document.Root.AddFirst(New XComment(
+                    "REVIEW BEFORE IMPORT. Review file: " & ReviewFileName &
+                    ". Automated review issues: " & result.ReviewIssues.Count.ToString() &
+                    ". The generator does not import this file or copy stored cube data."))
 
-                Dim outputName As String = If(result.ReviewIssues.Count = 0,
-                    "04_Clone_REVIEW_BEFORE_LOAD.xml", "04_Clone_DRAFT_DO_NOT_LOAD.xml.txt")
-                ' This workbook is an inspection snapshot. Editing it does NOT
-                ' update the accompanying XML and it is not a metadata import file.
-                ReviewWorkbookWriter.Save(Path.Combine(folder, "05_Excel_Review.xlsx"),
-                    ReviewWorkbookModel.Create(sourceDocument, result, chain,
-                        SourceRoot, Destination, NewRoot, outputName))
-                result.Document.Save(Path.Combine(folder, outputName))
+                Dim folder As String = Path.Combine(
+                    FileShareFolderHelper.GetDataManagementExportUsernameFolderForApp(
+                        si, True, AppServerConfig.GetSettings(si).FileShareRootFolder,
+                        si.AppToken.AppName),
+                    "MMRptgClone", DateTime.UtcNow.ToString("yyyyMMdd_HHmmss") & "_" &
+                    Guid.NewGuid().ToString("N").Substring(0, 8))
+                Directory.CreateDirectory(folder)
+                HierarchyPreviewWriter.Save(Path.Combine(folder, ReviewFileName),
+                    sourceDocument, result, chain, SourceRoot, Destination, NewRoot)
+                result.Document.Save(Path.Combine(folder, XmlFileName))
 
                 BRApi.ErrorLog.LogMessage(si, result.Report & Environment.NewLine &
                     "Files: " & folder & Environment.NewLine &
-                    "Excel review: 05_Excel_Review.xlsx. Workbook edits do not update XML." & Environment.NewLine &
+                    "Outputs: " & XmlFileName & " and " & ReviewFileName & Environment.NewLine &
+                    "Initial clone only; Excel restructuring is not applied. Review the HTML before importing XML." & Environment.NewLine &
                     "No member or relationship changes have been applied.")
                 Return Nothing
             Catch ex As Exception
@@ -269,7 +264,7 @@ Namespace OneStream.BusinessRule.Extender.BuildMMRptgClone
             report.AppendLine("Stored cube data is not copied. Existing detail member IDs are reused.")
             report.AppendLine("Dimension wrapper settings are retained from the snapshot; check for concurrent changes before load.")
             report.AppendLine("The destination receives a new child; that attachment is visible wherever the destination is shared or inherited.")
-            report.AppendLine("The source snapshot contains all Account dimensions, including their metadata properties and formulas.")
+            report.AppendLine("Source Account metadata was read into memory; no separate source backup, CSV, text report or workbook is generated.")
             If Not dims.ContainsKey(chain(0)) Then
                 report.AppendLine("The native export omitted built-in " & chain(0) &
                     "; all four business dimensions were validated and retained.")
@@ -487,565 +482,253 @@ End Namespace
 ' Workbook review support
 
 Namespace OneStream.BusinessRule.Extender.BuildMMRptgClone
-    Public Class ReviewWorkbookModel
+    ' Offline review only. Reads the snapshot/package and never changes either.
+    Public NotInheritable Class HierarchyPreviewWriter
         Private Shared ReadOnly CI As StringComparer = StringComparer.OrdinalIgnoreCase
+        Private Const MaxPathsPerPane As Integer = 10000
+        Private Const MaxDepth As Integer = 250
 
-        Public Shared Function Create(ByVal source As XDocument, ByVal package As ClonePackage,
-            ByVal chain As String(), ByVal sourceRoot As String, ByVal destination As String,
-            ByVal newRoot As String, ByVal cloneFileName As String) As List(Of ReviewSheet)
+        Private Class PreviewEdge
+            Public Child As String
+            Public Owner As String
+            Public Weight As String
+        End Class
 
-            Dim sheets As New List(Of ReviewSheet)
-            Dim sourceDims = source.Root.Element("metadataRoot").Element("dimensions").Elements("dimension").
-                Where(Function(d) CI.Equals(CStr(d.Attribute("type")), "Account")).ToList()
-            Dim targetDims = package.Document.Root.Element("metadataRoot").Element("dimensions").Elements("dimension").ToList()
-            Dim sourceMembers As New Dictionary(Of String, XElement)(CI)
-            Dim sourceOwners As New Dictionary(Of String, String)(CI)
-            For Each dimNode As XElement In sourceDims
-                For Each member As XElement In dimNode.Element("members").Elements("member")
-                    Dim name As String = Attr(member, "name")
-                    sourceMembers.Add(name, member)
-                    sourceOwners.Add(name, Attr(dimNode, "name"))
-                Next
+        Private Class PreviewMember
+            Public Owner As String
+            Public Description As String
+        End Class
+
+        Private Class RenderState
+            Public Count As Integer
+            Public Incomplete As Boolean
+            Public Path As New HashSet(Of String)(CI)
+        End Class
+
+        Public Shared Sub Save(ByVal path As String, ByVal source As XDocument,
+            ByVal package As ClonePackage, ByVal chain As String(),
+            ByVal sourceRoot As String, ByVal destination As String, ByVal newRoot As String)
+
+            If source Is Nothing Then Throw New ArgumentNullException("source")
+            If package Is Nothing OrElse package.Document Is Nothing Then Throw New ArgumentNullException("package")
+            If chain Is Nothing OrElse chain.Length < 2 Then Throw New ArgumentException("Configure the dimension chain.", "chain")
+            Dim sourceDims As Dictionary(Of String, XElement) = DimensionIndex(source)
+            Dim packageDims As Dictionary(Of String, XElement) = DimensionIndex(package.Document)
+            Dim members As Dictionary(Of String, PreviewMember) = MemberIndex(sourceDims)
+            For Each item As KeyValuePair(Of String, PreviewMember) In MemberIndex(packageDims)
+                members(item.Key) = item.Value
             Next
-            Dim targetNames As New HashSet(Of String)(package.NewNames, CI)
-            Dim inverse As New Dictionary(Of String, String)(CI)
-            For Each pair As KeyValuePair(Of String, String) In package.SourceToTarget
-                inverse.Add(pair.Value, pair.Key)
-            Next
-            Dim sourceEdges As New Dictionary(Of String, XElement)(CI)
-            Dim children As New Dictionary(Of String, List(Of XElement))(CI)
-            Dim edgeOwners As New Dictionary(Of XElement, String)
-            For Each dimNode As XElement In sourceDims.Where(Function(d) chain.Contains(Attr(d, "name"), CI))
-                For Each edge As XElement In dimNode.Element("relationships").Elements("relationship")
-                    sourceEdges.Add(Key(Attr(dimNode, "name"), Attr(edge, "parent"), Attr(edge, "child")), edge)
-                    Dim p As String = Attr(edge, "parent")
-                    If Not children.ContainsKey(p) Then children.Add(p, New List(Of XElement))
-                    children(p).Add(edge)
-                    edgeOwners.Add(edge, Attr(dimNode, "name"))
-                Next
-            Next
-            Dim issueRefs As New Dictionary(Of String, String)(CI)
-            Dim relevantNames As New HashSet(Of String)(package.SourceToTarget.Keys, CI)
-            For Each edge As XElement In sourceEdges.Values
-                If package.SourceToTarget.ContainsKey(Attr(edge, "parent")) Then relevantNames.Add(Attr(edge, "child"))
-            Next
-            For Each memberName As String In relevantNames
-                Dim ids As New List(Of String)
-                For i As Integer = 0 To package.ReviewIssues.Count - 1
-                    If package.ReviewIssues(i).IndexOf(memberName, StringComparison.OrdinalIgnoreCase) >= 0 Then ids.Add((i + 1).ToString())
-                Next
-                issueRefs.Add(memberName, String.Join(", ", ids.ToArray()))
+            Dim reverseMap As New Dictionary(Of String, String)(CI)
+            For Each item As KeyValuePair(Of String, String) In package.SourceToTarget
+                reverseMap(item.Value) = item.Key
             Next
 
-            Dim overview = MakeSheet("Overview", "MM reporting clone review",
-                "Inspection snapshot. Editing this workbook does not update the accompanying XML.",
-                New Object() {"Item", "Value"}, New Double() {42, 100})
-            Add(overview, "Source hierarchy", sourceRoot)
-            Add(overview, "Destination container", destination)
-            Add(overview, "New reporting root", newRoot)
-            Add(overview, "Export version", Attr(source.Root, "version"))
-            Add(overview, "Generated at", DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss 'UTC'", CultureInfo.InvariantCulture))
-            Add(overview, "Corresponding clone file", cloneFileName)
-            Add(overview, "New reporting members", package.NewNames.Count)
-            Dim allTargetEdges = targetDims.SelectMany(Function(d) d.Element("relationships").Elements("relationship")).ToList()
-            Dim reused As New HashSet(Of String)(allTargetEdges.Where(Function(e) targetNames.Contains(Attr(e, "parent")) AndAlso
-                Not targetNames.Contains(Attr(e, "child"))).Select(Function(e) Attr(e, "child")), CI)
-            Add(overview, "Distinct reused detail accounts", reused.Count)
-            Add(overview, "Review items", package.ReviewIssues.Count)
-            Add(overview, "Metadata applied by the generator", "None. It writes files and log entries only.")
-            Add(overview, "Workbook use", "Review only. This XLSX is not a OneStream metadata import file or the Marketplace Metadata Builder template.")
-            Add(overview, "Stored data", "Not copied to the new reporting member IDs.")
-            Add(overview, "Formula references", "Preserved as exported. Review references to original members.")
-            Add(overview, "Aliases", "Original aliases are cleared on new members; both values appear in Properties.")
-            Add(overview, "Existing dimension settings", "Copied from the source snapshot into the XML dimension wrappers. Check for later changes before import.")
-            Add(overview, "Destination relationship", "The new root appears wherever the destination container is shared or inherited.")
-            Add(overview, "Source snapshot", "01_Source_Account_Metadata.xml contains all exported Account metadata.")
-            Add(overview, "RootAccountDim export", If(sourceDims.Any(Function(d) CI.Equals(Attr(d, "name"), "RootAccountDim")),
-                "Present", "Omitted by the export; the four business dimensions are still validated."))
-            For Each dimName As String In chain.Skip(1)
-                Dim d As XElement = targetDims.FirstOrDefault(Function(x) CI.Equals(Attr(x, "name"), dimName))
-                Dim membersCount As Integer = If(d Is Nothing, 0, d.Element("members").Elements("member").Count())
-                Dim localEdges As List(Of XElement) = If(d Is Nothing, New List(Of XElement), d.Element("relationships").Elements("relationship").ToList())
-                Dim attachmentCount As Integer = localEdges.Where(Function(e) CI.Equals(Attr(e, "parent"), destination) AndAlso CI.Equals(Attr(e, "child"), newRoot)).Count()
-                Add(overview, dimName & " - new members", membersCount)
-                Add(overview, dimName & " - copied internal relationships", localEdges.Count - attachmentCount)
-                Add(overview, dimName & " - new destination attachments", attachmentCount)
-                Add(overview, dimName & " - distinct reused detail accounts", localEdges.Where(Function(e) targetNames.Contains(Attr(e, "parent")) AndAlso
-                    Not targetNames.Contains(Attr(e, "child"))).Select(Function(e) Attr(e, "child")).Distinct(CI).Count())
+            Dim html As New StringBuilder
+            html.AppendLine("<!doctype html><html lang='en'><head><meta charset='utf-8'>")
+            html.AppendLine("<meta name='viewport' content='width=device-width,initial-scale=1'>")
+            html.AppendLine("<meta http-equiv='Content-Security-Policy' content=""default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"">")
+            html.AppendLine("<title>Initial hierarchy clone preview</title><style>")
+            html.AppendLine(".report-text{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.5 Arial,sans-serif;max-height:360px;overflow:auto;background:#f8fafc;padding:12px}.review-state{font-weight:bold;margin-top:14px}")
+            html.AppendLine(".node-meta{display:none}#show-details:checked~.selector .node-meta{display:block}.detail-label{display:inline-block;margin:0 0 16px 6px}.badge{font-size:11px!important}")
+            html.AppendLine("*{box-sizing:border-box}body{margin:0;background:#f4f6f8;color:#202a35;font:14px/1.45 Arial,sans-serif}main{max-width:1800px;margin:auto;padding:28px}h1{margin:0 0 8px;font-size:28px;line-height:1.2}h2{font-size:18px;margin:0 0 5px}p{margin:6px 0 12px}.eyebrow{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#576678;font-weight:bold}.intro,.review{background:white;border:1px solid #d6dde4;border-radius:8px;padding:20px;margin-bottom:18px}.notice{border-left:4px solid #446b94;padding:8px 12px;background:#f0f5fb;margin:14px 0}.muted,.meta{color:#5c6875}.meta{font-size:12px;overflow-wrap:anywhere}.selector{margin-bottom:14px}.selector p{font-weight:bold;margin:0 0 8px}.view-radio{position:absolute;width:1px;height:1px;clip:rect(0,0,0,0);overflow:hidden}.tabs{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:14px}.tabs label{cursor:pointer;border:1px solid #bdc8d3;border-radius:5px;padding:9px 14px;background:white;overflow-wrap:anywhere}.view-radio:focus-visible+.focus-proxy{outline:2px solid #285c90}.view{display:none}.view-note{font-size:13px;margin-bottom:12px}.panes{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px}.pane{min-width:0;background:white;border:1px solid #cfd8e1;border-radius:8px;overflow:hidden}.pane-head{padding:15px 18px;border-bottom:1px solid #dbe2e8;background:#fafbfc}.pane.proposed .pane-head{background:#f2f6fb}.tree{padding:16px 16px 20px;overflow:auto;max-height:76vh}.branch{list-style:none;margin:0;padding:0}.branch .branch{margin-left:7px;padding-left:19px;border-left:1px solid #d2d8df}.node{position:relative;margin:0;padding:3px 0;min-width:210px}.branch .branch>.node:before{content:'';position:absolute;left:-19px;top:17px;width:17px;border-top:1px solid #d2d8df}.node>details>summary{cursor:pointer;list-style:revert;min-height:25px}.node>details>summary::marker{color:#6a7886}.leaf{padding-left:17px}.name{font-weight:600;overflow-wrap:anywhere}.badge{display:inline-block;font-size:10px;line-height:17px;padding:0 6px;border-radius:9px;margin-left:7px;vertical-align:1px;white-space:nowrap;font-weight:bold;text-transform:uppercase}.new{background:#e6eef9;color:#244f87}.reuse{background:#e5f1e9;color:#2d6843}.existing{background:#eef0f3;color:#5b6470}.node-meta{margin:1px 0 4px 17px}.description{font-size:12px;color:#566575;margin-bottom:2px}.weight{font-size:11px;color:#586471;white-space:nowrap;margin-left:8px}.warning{background:#fff1d7;border:1px solid #e0bd77;color:#674900;border-radius:4px;padding:10px;margin:8px 0;overflow-wrap:anywhere}.status{font-size:12px;color:#5c6875;padding:10px 18px;border-top:1px solid #e1e6eb}.review summary{cursor:pointer;font-weight:bold}.review ul{margin-bottom:0;padding-left:22px}.review li{margin:7px 0;overflow-wrap:anywhere}.legend{display:flex;flex-wrap:wrap;gap:10px;margin:12px 0 0}.legend .badge{margin-left:0}.empty{padding:12px;color:#596675}footer{color:#66717e;font-size:12px;margin-top:18px}@media(max-width:900px){main{padding:16px}.panes{grid-template-columns:1fr}.tree{max-height:65vh}h1{font-size:24px}}@media print{body{background:white}main{padding:0}.tree{max-height:none;overflow:visible}.panes{grid-template-columns:1fr}.tabs{display:none}.pane{break-inside:avoid}}")
+            For i As Integer = 1 To chain.Length - 1
+                Dim key As String = i.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                html.AppendLine("#dim" & key & ":checked~.tabs label[for='dim" & key & "']{background:#254f7c;color:white;border-color:#254f7c}#dim" & key & ":focus-visible~.tabs label[for='dim" & key & "']{outline:3px solid #8fb8e4;outline-offset:2px}#dim" & key & ":checked~#view" & key & "{display:block}")
             Next
-            sheets.Add(overview)
-
-            Dim hierarchy = MakeSheet("Hierarchy", "Proposed reporting hierarchy",
-                "All paths in the combined dimension chain. Shared members repeat on each path; Relationships is the authoritative edge list.",
-                New Object() {"Level", "Source member", "Proposed hierarchy (indented)", "Source parent", "Proposed parent", "Member action", "Relationship dimension", "Weight", "Review item IDs"},
-                New Double() {9, 32, 53, 32, 36, 22, 28, 16, 20})
-            Dim rootAttachment As XElement = allTargetEdges.FirstOrDefault(Function(e) CI.Equals(Attr(e, "parent"), destination) AndAlso CI.Equals(Attr(e, "child"), newRoot))
-            Add(hierarchy, 0, sourceRoot, newRoot, "", If(rootAttachment Is Nothing, "Attachment not emitted", destination),
-                "New root", sourceOwners(sourceRoot), If(rootAttachment Is Nothing, "Not emitted", Weight(rootAttachment)), issueRefs(sourceRoot))
-            AddChildren(hierarchy, sourceRoot, newRoot, 1, children, edgeOwners, package.SourceToTarget, issueRefs)
-            sheets.Add(hierarchy)
-
-            Dim memberSheet = MakeSheet("Members", "New reporting member definitions",
-                "Only new member definitions are listed. Full descriptions, aliases and varying properties are shown in Properties.",
-                New Object() {"Source member", "New member", "Owning dimension", "Description preview", "Account type", "Formula type", "Allow input", "Is consolidated", "Original aliases", "New aliases", "Review item IDs"},
-                New Double() {32, 36, 28, 60, 18, 22, 18, 22, 36, 22, 20})
-            Dim props = MakeSheet("Properties", "Original and proposed member settings",
-                "Long values are split into numbered parts without truncation. Formula strings are text, never executable Excel formulas.",
-                New Object() {"Dimension", "Source member", "New member", "Kind", "Property or attribute", "Cube type", "Scenario type", "Time", "Other context", "Part", "Parts", "Original value", "Proposed value", "Review item IDs"},
-                New Double() {26, 32, 36, 22, 32, 18, 20, 18, 45, 9, 9, 80, 80, 20})
-            For Each dimNode As XElement In targetDims
-                For Each newMember As XElement In dimNode.Element("members").Elements("member")
-                    Dim targetName As String = Attr(newMember, "name")
-                    Dim oldName As String = inverse(targetName)
-                    Dim oldMember As XElement = sourceMembers(oldName)
-                    Add(memberSheet, oldName, targetName, Attr(dimNode, "name"), Preview(Attr(newMember, "description")),
-                        MemberProperty(newMember, "AccountType"), MemberProperty(newMember, "FormulaType"),
-                        MemberProperty(newMember, "AllowInput"), MemberProperty(newMember, "IsConsolidated"),
-                        Preview(Aliases(oldMember)), Preview(Aliases(newMember)), issueRefs(oldName))
-                    AddMemberProperties(props, Attr(dimNode, "name"), oldName, targetName, oldMember, newMember, issueRefs(oldName))
-                Next
-            Next
-            sheets.Add(memberSheet)
-
-            Dim relationships = MakeSheet("Relationships", "Proposed relationships",
-                "One row per dimension-owned XML relationship. Existing relationships are retained; the destination attachment is separately identified.",
-                New Object() {"Owning dimension", "Source parent", "Source child", "Proposed parent", "Proposed child", "Child action", "Original weight", "Proposed weight", "Order within parent in XML", "Other relationship attributes", "Relationship action"},
-                New Double() {28, 32, 32, 36, 36, 22, 18, 18, 22, 60, 28})
-            For Each dimNode As XElement In targetDims
-                Dim ordinal As New Dictionary(Of String, Integer)(CI)
-                For Each edge As XElement In dimNode.Element("relationships").Elements("relationship")
-                    Dim p As String = Attr(edge, "parent"), c As String = Attr(edge, "child")
-                    If Not ordinal.ContainsKey(p) Then ordinal.Add(p, 0)
-                    ordinal(p) += 1
-                    Dim attachment As Boolean = CI.Equals(p, destination) AndAlso CI.Equals(c, newRoot)
-                    Dim oldParent As String = If(attachment, "", inverse(p))
-                    Dim oldChild As String = If(attachment, "", If(inverse.ContainsKey(c), inverse(c), c))
-                    Dim oldEdge As XElement = Nothing
-                    If Not attachment Then oldEdge = sourceEdges(Key(Attr(dimNode, "name"), oldParent, oldChild))
-                    Dim attributes As String = String.Join("; ", edge.Attributes().Where(Function(a) Not {"parent", "child", "aggregationWeight"}.
-                        Contains(a.Name.LocalName, CI)).Select(Function(a) a.ToString()).ToArray())
-                    Add(relationships, Attr(dimNode, "name"), oldParent, oldChild, p, c,
-                        If(targetNames.Contains(c), "New parent", "Reuse existing account"),
-                        If(oldEdge Is Nothing, "New relationship", Weight(oldEdge)), Weight(edge), ordinal(p), attributes,
-                        If(attachment, "New destination attachment", "Copy internal relationship"))
-                    AddSectionProperties(props, Attr(dimNode, "name"), oldParent & " -> " & oldChild,
-                        p & " -> " & c, "Relationship section", oldEdge, edge, "")
-                Next
-            Next
-            sheets.Add(relationships)
-            sheets.Add(props)
-            Dim issues = MakeSheet("Review", "Items requiring review",
-                "Automated checks do not establish zero impact on existing reports or hierarchies. Validate a test import before production use.",
-                New Object() {"Item ID", "Review detail"}, New Double() {12, 125})
+            html.AppendLine("</style></head><body><main><header class='intro'><div class='eyebrow'>Offline metadata review</div><h1>Initial hierarchy clone preview</h1>")
+            html.AppendLine("<p>Compare the original branch with the proposed clone under its destination. Select a dimension view, then expand or collapse any triangle.</p>")
+            html.AppendLine("<div class='notice'><strong>Excel restructuring is not applied.</strong> This shows the initial clone XML package. Any later restructuring requires updated XML and a regenerated preview. This is a metadata illustration, not a OneStream runtime view.</div>")
+            html.AppendLine("<p class='muted'>New reporting members receive new IDs. Stored input on original parents is not copied. Existing detail accounts retain their names and IDs. The generator does not import or apply metadata.</p>")
+            If package.ReviewIssues.Count > 0 Then
+                html.AppendLine("<div class='warning review-state'>REQUIRES REVIEW: " & package.ReviewIssues.Count.ToString(System.Globalization.CultureInfo.InvariantCulture) & " automated issue(s) need attention before any import. This preview does not validate the package for loading.</div>")
+            Else
+                html.AppendLine("<p class='review-state'>Review required before loading. No automated issues were reported; this preview does not validate the package for import.</p>")
+            End If
+            html.AppendLine("<div class='legend'><span><span class='badge new'>New member</span> cloned parent</span><span><span class='badge reuse'>Reused</span> existing account</span><span><span class='badge existing'>Existing</span> source or destination</span></div></header>")
+            html.AppendLine("<section class='review'><details><summary>Review issues (" & package.ReviewIssues.Count.ToString(System.Globalization.CultureInfo.InvariantCulture) & ")</summary>")
             If package.ReviewIssues.Count = 0 Then
-                Add(issues, "", "No automated review items were detected. The package still requires XML inspection and a test import.")
+                html.AppendLine("<p>No automated review issues were reported. Review the native XML and validate in a test application before loading.</p>")
             Else
-                For i As Integer = 0 To package.ReviewIssues.Count - 1
-                    Add(issues, i + 1, package.ReviewIssues(i))
+                html.AppendLine("<ul>")
+                For Each issue As String In package.ReviewIssues
+                    html.AppendLine("<li>" & H(issue) & "</li>")
                 Next
+                html.AppendLine("</ul>")
             End If
-            sheets.Add(issues)
-            Return sheets
-        End Function
-
-        Private Shared Function MakeSheet(ByVal name As String, ByVal title As String, ByVal note As String,
-            ByVal headers As Object(), ByVal widths As Double()) As ReviewSheet
-            Dim sheet As New ReviewSheet With {.Name = name, .Widths = widths, .HeaderRow = 4, .FreezeRows = 4,
-                .FreezeColumns = If(name = "Overview" OrElse name = "Review", 0, 2)}
-            sheet.Rows.Add(New Object() {title})
-            sheet.Rows.Add(New Object() {note})
-            sheet.Rows.Add(New Object() {})
-            sheet.Rows.Add(headers)
-            Return sheet
-        End Function
-
-        Private Shared Sub Add(ByVal sheet As ReviewSheet, ParamArray values As Object())
-            If sheet.Rows.Count >= 1000000 Then Throw New InvalidOperationException("Excel review sheet exceeds its row limit: " & sheet.Name)
-            sheet.Rows.Add(values)
-        End Sub
-
-        Private Shared Sub AddChildren(ByVal sheet As ReviewSheet, ByVal oldParent As String, ByVal newParent As String,
-            ByVal depth As Integer, ByVal children As Dictionary(Of String, List(Of XElement)),
-            ByVal owners As Dictionary(Of XElement, String), ByVal mapping As Dictionary(Of String, String),
-            ByVal issues As Dictionary(Of String, String))
-            If depth > 500 Then Throw New InvalidOperationException("Hierarchy exceeds 500 levels.")
-            If Not children.ContainsKey(oldParent) Then Return
-            For Each edge As XElement In children(oldParent)
-                If sheet.Rows.Count >= 200000 Then Throw New InvalidOperationException("Hierarchy path expansion exceeds 200,000 rows. Inspect the Relationships sheet model instead.")
-                Dim oldChild As String = Attr(edge, "child")
-                Dim newChild As String = If(mapping.ContainsKey(oldChild), mapping(oldChild), oldChild)
-                Add(sheet, depth, oldChild, New String(" "c, depth * 2) & newChild, oldParent, newParent,
-                    If(mapping.ContainsKey(oldChild), "New parent", "Reuse existing account"), owners(edge), Weight(edge), issues(oldChild))
-                AddChildren(sheet, oldChild, newChild, depth + 1, children, owners, mapping, issues)
+            html.AppendLine("</details></section><section class='review'><details><summary>Package report and review notes</summary><pre class='report-text'>" & H(package.Report) & "</pre></details></section><input type='checkbox' id='show-details'><label class='detail-label' for='show-details'>Show member details</label><section class='selector' aria-label='Effective dimension views'><p>Select an effective dimension view</p>")
+            For i As Integer = 1 To chain.Length - 1
+                Dim key As String = i.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                html.AppendLine("<input class='view-radio' type='radio' name='dimension' id='dim" & key & "'" & If(i = chain.Length - 1, " checked", "") & ">")
             Next
-        End Sub
-
-        Private Shared Sub AddMemberProperties(ByVal sheet As ReviewSheet, ByVal dimName As String,
-            ByVal oldName As String, ByVal newName As String, ByVal oldMember As XElement, ByVal newMember As XElement, ByVal issueIds As String)
-            For Each name As XName In oldMember.Attributes().Select(Function(a) a.Name).Union(newMember.Attributes().Select(Function(a) a.Name))
-                PropertyParts(sheet, dimName, oldName, newName, "Member attribute", name.LocalName, "", "", "", "",
-                    CStr(oldMember.Attribute(name)), CStr(newMember.Attribute(name)), issueIds)
+            html.AppendLine("<div class='tabs'>")
+            For i As Integer = 1 To chain.Length - 1
+                Dim key As String = i.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                html.AppendLine("<label for='dim" & key & "'>" & H(chain(i)) & "</label>")
             Next
-            Dim oldProperties = oldMember.Elements("properties").Elements().ToList()
-            Dim newProperties = newMember.Elements("properties").Elements().ToList()
-            If oldProperties.Count <> newProperties.Count Then Throw New InvalidOperationException("Property alignment changed for " & oldName)
-            For i As Integer = 0 To oldProperties.Count - 1
-                Dim a As XElement = oldProperties(i), b As XElement = newProperties(i)
-                Dim other As String = String.Join("; ", a.Attributes().Where(Function(x) Not {"name", "value", "cubeType", "scenarioType", "time"}.
-                    Contains(x.Name.LocalName, CI)).Select(Function(x) x.ToString()).ToArray())
-                PropertyParts(sheet, dimName, oldName, newName, "Member property", Attr(a, "name"), Attr(a, "cubeType"),
-                    Attr(a, "scenarioType"), Attr(a, "time"), other,
-                    If(a.Attribute("value") Is Nothing, a.ToString(SaveOptions.DisableFormatting), Attr(a, "value")),
-                    If(b.Attribute("value") Is Nothing, b.ToString(SaveOptions.DisableFormatting), Attr(b, "value")), issueIds)
-            Next
-            Dim oldSections = oldMember.Elements().Where(Function(e) e.Name.LocalName <> "properties").ToList()
-            Dim newSections = newMember.Elements().Where(Function(e) e.Name.LocalName <> "properties").ToList()
-            If oldSections.Count <> newSections.Count Then Throw New InvalidOperationException("Member section alignment changed for " & oldName)
-            For i As Integer = 0 To oldSections.Count - 1
-                PropertyParts(sheet, dimName, oldName, newName, "Member section", oldSections(i).Name.LocalName,
-                    "", "", "", "", oldSections(i).ToString(SaveOptions.DisableFormatting),
-                    newSections(i).ToString(SaveOptions.DisableFormatting), issueIds)
-            Next
-        End Sub
+            html.AppendLine("</div>")
 
-        Private Shared Sub AddSectionProperties(ByVal sheet As ReviewSheet, ByVal dimName As String,
-            ByVal oldName As String, ByVal newName As String, ByVal kind As String,
-            ByVal oldNode As XElement, ByVal newNode As XElement, ByVal issueIds As String)
-            If oldNode Is Nothing Then Return
-            PropertyParts(sheet, dimName, oldName, newName, kind, "Full relationship XML", "", "", "", "",
-                oldNode.ToString(SaveOptions.DisableFormatting), newNode.ToString(SaveOptions.DisableFormatting), issueIds)
-        End Sub
-
-        Private Shared Sub PropertyParts(ByVal sheet As ReviewSheet, ByVal dimName As String, ByVal oldName As String,
-            ByVal newName As String, ByVal kind As String, ByVal propertyName As String, ByVal cube As String,
-            ByVal scenario As String, ByVal time As String, ByVal context As String, ByVal oldValue As String,
-            ByVal newValue As String, ByVal issueIds As String)
-            Dim a = SplitText(If(oldValue, "")), b = SplitText(If(newValue, ""))
-            Dim count As Integer = Math.Max(a.Count, b.Count)
-            For i As Integer = 0 To count - 1
-                Add(sheet, dimName, oldName, newName, kind, propertyName, cube, scenario, time, context,
-                    i + 1, count, If(i < a.Count, a(i), ""), If(i < b.Count, b(i), ""), issueIds)
-            Next
-        End Sub
-
-        Private Shared Function SplitText(ByVal value As String) As List(Of String)
-            Dim parts As New List(Of String)
-            Dim offset As Integer = 0
-            While offset < value.Length
-                Dim length As Integer = Math.Min(32000, value.Length - offset)
-                If offset + length < value.Length AndAlso Char.IsHighSurrogate(value(offset + length - 1)) Then length -= 1
-                parts.Add(value.Substring(offset, length))
-                offset += length
-            End While
-            If parts.Count = 0 Then parts.Add("")
-            Return parts
-        End Function
-
-        Private Shared Function Preview(ByVal value As String) As String
-            If value.Length <= 1000 Then Return value
-            Dim length As Integer = 1000
-            If Char.IsHighSurrogate(value(length - 1)) Then length -= 1
-            Return value.Substring(0, length) & " ... [full value in Properties]"
-        End Function
-
-        Private Shared Function Attr(ByVal node As XElement, ByVal name As String) As String
-            Return If(node Is Nothing, "", If(CStr(node.Attribute(name)), ""))
-        End Function
-
-        Private Shared Function MemberProperty(ByVal member As XElement, ByVal name As String) As String
-            Dim p = member.Descendants("property").FirstOrDefault(Function(x) CI.Equals(Attr(x, "name"), name))
-            Return If(p Is Nothing, "Not explicitly set", Attr(p, "value"))
-        End Function
-
-        Private Shared Function Aliases(ByVal member As XElement) As String
-            Dim values As New List(Of String)
-            For Each a As XAttribute In member.Attributes().Where(Function(x) CI.Equals(x.Name.LocalName, "Alias") OrElse CI.Equals(x.Name.LocalName, "Aliases"))
-                values.Add(a.Value)
-            Next
-            For Each p As XElement In member.Descendants("property").Where(Function(x) CI.Equals(Attr(x, "name"), "Alias") OrElse CI.Equals(Attr(x, "name"), "Aliases"))
-                values.Add(Attr(p, "value"))
-            Next
-            Return String.Join(", ", values.Where(Function(v) v.Length > 0).ToArray())
-        End Function
-
-        Private Shared Function Weight(ByVal edge As XElement) As Object
-            Dim text As String = Attr(edge, "aggregationWeight")
-            If text.Length = 0 Then Return "Not explicitly set"
-            Dim value As Decimal
-            If Decimal.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, value) Then Return value
-            Return text
-        End Function
-
-        Private Shared Function Key(ByVal dimName As String, ByVal parent As String, ByVal child As String) As String
-            Return dimName & ChrW(0) & parent & ChrW(0) & child
-        End Function
-    End Class
-End Namespace
-
-
-Namespace OneStream.BusinessRule.Extender.BuildMMRptgClone
-    ' A static review snapshot. It does not read spreadsheet edits or update the XML package.
-    Public Class ReviewSheet
-        Public Name As String
-        Public Rows As New List(Of Object())
-        Public Widths As Double()
-        Public FreezeRows As Integer
-        Public FreezeColumns As Integer
-        Public HeaderRow As Integer
-    End Class
-
-    Public Class ReviewWorkbookWriter
-        Private Shared ReadOnly MainNs As XNamespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-        Private Shared ReadOnly RelNs As XNamespace = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-        Private Shared ReadOnly PackageNs As XNamespace = "http://schemas.openxmlformats.org/package/2006/relationships"
-        Private Shared ReadOnly TypesNs As XNamespace = "http://schemas.openxmlformats.org/package/2006/content-types"
-
-        Public Shared Sub Save(ByVal path As String, ByVal sheets As List(Of ReviewSheet))
-            If String.IsNullOrWhiteSpace(path) Then Throw New ArgumentException("Workbook output path is required.")
-            If sheets Is Nothing OrElse sheets.Count = 0 Then Throw New ArgumentException("At least one review sheet is required.")
-            Dim names As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
-            For Each sheet As ReviewSheet In sheets
-                ValidateSheet(sheet)
-                If Not names.Add(sheet.Name) Then Throw New ArgumentException("Duplicate worksheet name: " & sheet.Name)
-            Next
-            ' CreateNew avoids replacing an existing user file. Failed builds should be discarded.
-            Dim created As Boolean = False
-            Try
-                Using stream As New FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None)
-                    created = True
-                    Using zip As New System.IO.Compression.ZipArchive(stream, System.IO.Compression.ZipArchiveMode.Create, False)
-                        Put(zip, "[Content_Types].xml", ContentTypes(sheets.Count))
-                        Put(zip, "_rels/.rels", New XDocument(New XElement(PackageNs + "Relationships",
-                            New XElement(PackageNs + "Relationship", New XAttribute("Id", "rId1"), New XAttribute("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"), New XAttribute("Target", "xl/workbook.xml")))))
-                        Put(zip, "xl/workbook.xml", Workbook(sheets))
-                        Put(zip, "xl/_rels/workbook.xml.rels", WorkbookRelationships(sheets.Count))
-                        Put(zip, "xl/styles.xml", Styles())
-                        For i As Integer = 0 To sheets.Count - 1
-                            Put(zip, "xl/worksheets/sheet" & (i + 1).ToString(CultureInfo.InvariantCulture) & ".xml", Worksheet(sheets(i)))
-                        Next
-                    End Using
-                End Using
-            Catch ex As Exception
-                If created Then
-                    Try
-                        File.Delete(path)
-                    Catch
-                        ' Preserve the original failure, including the output path.
-                    End Try
+            Dim original As New Dictionary(Of String, List(Of PreviewEdge))(CI)
+            Dim proposed As New Dictionary(Of String, List(Of PreviewEdge))(CI)
+            Dim packageEdges As New Dictionary(Of String, List(Of PreviewEdge))(CI)
+            For i As Integer = 0 To chain.Length - 1
+                AddDimensionEdges(sourceDims, chain(i), original)
+                AddDimensionEdges(sourceDims, chain(i), proposed)
+                AddDimensionEdges(packageDims, chain(i), proposed)
+                AddDimensionEdges(packageDims, chain(i), packageEdges)
+                If i = 0 Then Continue For
+                Dim key As String = i.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                html.AppendLine("<section class='view' id='view" & key & "' aria-label='" & H(chain(i)) & " view'>")
+                html.AppendLine("<p class='view-note'><strong>" & H(chain(i)) & "</strong> includes relationships exported in this dimension and all preceding dimensions in the configured inheritance chain. Shared accounts appear on every parent path. The edge weight and owning dimension are shown under each account.</p><div class='panes'>")
+                AppendPane(html, "Original hierarchy", "Source branch in the current metadata snapshot", sourceRoot, original, members, reverseMap, False)
+                html.AppendLine("<article class='pane proposed'><header class='pane-head'><h2>Proposed clone</h2><div class='meta'>Actual clone package edges under the existing destination</div></header>")
+                If Not HasAttachment(packageEdges, destination, newRoot) Then
+                    html.AppendLine("<div class='warning'>Attachment missing: the package has no relationship from " & H(destination) & " to " & H(newRoot) & " in this view. The clone is not attached here. No attachment has been invented in this preview.</div>")
                 End If
-                Throw New InvalidOperationException("Could not write review workbook '" & path & "': " & ex.Message, ex)
-            End Try
-        End Sub
-
-        Private Shared Sub ValidateSheet(ByVal sheet As ReviewSheet)
-            If sheet Is Nothing OrElse String.IsNullOrWhiteSpace(sheet.Name) Then Throw New ArgumentException("Worksheet name is required.")
-            CheckText(sheet.Name, "Worksheet name")
-            If sheet.Name.Length > 31 OrElse sheet.Name.IndexOfAny(New Char() {":"c, ChrW(92), "/"c, "?"c, "*"c, "["c, "]"c}) >= 0 OrElse sheet.Name.StartsWith("'", StringComparison.Ordinal) OrElse sheet.Name.EndsWith("'", StringComparison.Ordinal) Then
-                Throw New ArgumentException("Invalid Excel worksheet name: " & sheet.Name)
-            End If
-            If sheet.Rows Is Nothing OrElse sheet.Rows.Count > 1048576 Then Throw New ArgumentException("Invalid row count on " & sheet.Name)
-            If sheet.FreezeRows < 0 OrElse sheet.FreezeRows >= 1048576 Then Throw New ArgumentException("Invalid freeze row count on " & sheet.Name)
-            If sheet.FreezeColumns < 0 OrElse sheet.FreezeColumns >= 16384 Then Throw New ArgumentException("Invalid freeze column count on " & sheet.Name)
-            If sheet.HeaderRow < 0 OrElse sheet.HeaderRow > sheet.Rows.Count Then Throw New ArgumentException("Invalid header row on " & sheet.Name)
-            If sheet.Widths IsNot Nothing Then
-                If sheet.Widths.Length > 16384 Then Throw New ArgumentException("Too many column widths on " & sheet.Name)
-                For Each width As Double In sheet.Widths
-                    If Double.IsNaN(width) OrElse Double.IsInfinity(width) OrElse width <= 0 OrElse width > 255 Then Throw New ArgumentException("Invalid column width on " & sheet.Name)
-                Next
-            End If
-            For r As Integer = 0 To sheet.Rows.Count - 1
-                Dim row As Object() = sheet.Rows(r)
-                If row Is Nothing Then Continue For
-                If row.Length > 16384 Then Throw New ArgumentException("Too many columns in " & sheet.Name & " row " & (r + 1).ToString())
-                For c As Integer = 0 To row.Length - 1
-                    Dim item As Object = row(c)
-                    If item Is Nothing OrElse Convert.IsDBNull(item) OrElse IsNumericValue(item) Then Continue For
-                    CheckText(Convert.ToString(item, CultureInfo.InvariantCulture), "Cell " & sheet.Name & "!" & ColumnName(c + 1) & (r + 1).ToString())
-                Next
-            Next
-        End Sub
-
-        Private Shared Sub CheckText(ByVal value As String, ByVal label As String)
-            If value Is Nothing Then Return
-            If value.Length > 32767 Then Throw New ArgumentException(label & " exceeds Excel's 32,767-character cell limit; split it before writing.")
-            Try
-                XmlConvert.VerifyXmlChars(value)
-            Catch ex As Exception
-                Throw New ArgumentException(label & " contains characters not permitted in XML 1.0.", ex)
-            End Try
-        End Sub
-
-        Private Shared Function IsNumericValue(ByVal value As Object) As Boolean
-            Return TypeOf value Is Byte OrElse TypeOf value Is SByte OrElse TypeOf value Is Short OrElse
-                   TypeOf value Is UShort OrElse TypeOf value Is Integer OrElse TypeOf value Is UInteger OrElse
-                   TypeOf value Is Long OrElse TypeOf value Is ULong OrElse TypeOf value Is Single OrElse
-                   TypeOf value Is Double OrElse TypeOf value Is Decimal
-        End Function
-
-        Private Shared Function Cell(ByVal value As Object, ByVal address As String, ByVal style As Integer) As XElement
-            If value IsNot Nothing AndAlso Not Convert.IsDBNull(value) AndAlso Not IsNumericValue(value) Then
-                If style = 0 Then style = 5
-                If style = 4 Then style = 6
-            End If
-            Dim cellNode As New XElement(MainNs + "c", New XAttribute("r", address), New XAttribute("s", style))
-            If value Is Nothing OrElse Convert.IsDBNull(value) Then Return cellNode
-            If IsNumericValue(value) Then
-                If (TypeOf value Is Double AndAlso (Double.IsNaN(CDbl(value)) OrElse Double.IsInfinity(CDbl(value)))) OrElse
-                   (TypeOf value Is Single AndAlso (Single.IsNaN(CSng(value)) OrElse Single.IsInfinity(CSng(value)))) Then
-                    Throw New ArgumentException("Non-finite numeric value at " & address)
+                AppendTree(html, destination, proposed, members, reverseMap, True)
+                If Not HasAttachment(packageEdges, destination, newRoot) Then
+                    html.AppendLine("<div class='pane-head'><h2>Unattached clone branch</h2><div class='meta'>Shown separately for inspection; this is not connected to the destination.</div></div>")
+                    AppendTree(html, newRoot, proposed, members, reverseMap, True)
                 End If
-                cellNode.Add(New XElement(MainNs + "v", Convert.ToString(value, CultureInfo.InvariantCulture)))
+                html.AppendLine("</article></div></section>")
+            Next
+            html.AppendLine("</section><footer>Generated from the source snapshot and initial clone package at " & H(DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss 'UTC'", System.Globalization.CultureInfo.InvariantCulture)) & ". This standalone file uses no scripts or network resources. Paths are limited to " & MaxPathsPerPane.ToString(System.Globalization.CultureInfo.InvariantCulture) & " account occurrences per tree and " & MaxDepth.ToString(System.Globalization.CultureInfo.InvariantCulture) & " levels; any incomplete tree is explicitly marked.</footer></main></body></html>")
+            File.WriteAllText(path, html.ToString(), New UTF8Encoding(False))
+        End Sub
+
+        Private Shared Sub AppendPane(ByVal html As StringBuilder, ByVal heading As String,
+            ByVal caption As String, ByVal root As String,
+            ByVal graph As Dictionary(Of String, List(Of PreviewEdge)),
+            ByVal members As Dictionary(Of String, PreviewMember),
+            ByVal reverseMap As Dictionary(Of String, String), ByVal isProposed As Boolean)
+            html.AppendLine("<article class='pane'><header class='pane-head'><h2>" & H(heading) & "</h2><div class='meta'>" & H(caption) & "</div></header>")
+            AppendTree(html, root, graph, members, reverseMap, isProposed)
+            html.AppendLine("</article>")
+        End Sub
+
+        Private Shared Sub AppendTree(ByVal html As StringBuilder, ByVal root As String,
+            ByVal graph As Dictionary(Of String, List(Of PreviewEdge)),
+            ByVal members As Dictionary(Of String, PreviewMember),
+            ByVal reverseMap As Dictionary(Of String, String), ByVal isProposed As Boolean)
+            Dim state As New RenderState
+            html.AppendLine("<div class='tree'><ul class='branch'>")
+            AppendNode(html, root, Nothing, graph, members, reverseMap, isProposed, state, 0)
+            html.AppendLine("</ul></div>")
+            If state.Incomplete Then
+                html.AppendLine("<div class='warning'>INCOMPLETE PREVIEW: at least one branch was stopped by a cycle, depth limit, or path limit. Use the native XML for the complete metadata graph.</div>")
+            End If
+            html.AppendLine("<div class='status'>" & state.Count.ToString(System.Globalization.CultureInfo.InvariantCulture) & " account occurrences shown. Repeated shared paths are retained; counts are not distinct member counts.</div>")
+        End Sub
+
+        Private Shared Sub AppendNode(ByVal html As StringBuilder, ByVal name As String,
+            ByVal incoming As PreviewEdge, ByVal graph As Dictionary(Of String, List(Of PreviewEdge)),
+            ByVal members As Dictionary(Of String, PreviewMember), ByVal reverseMap As Dictionary(Of String, String),
+            ByVal isProposed As Boolean, ByVal state As RenderState, ByVal depth As Integer)
+            If state.Count >= MaxPathsPerPane OrElse depth > MaxDepth OrElse state.Path.Contains(name) Then
+                state.Incomplete = True
+                Dim reason As String = If(state.Path.Contains(name), "Cycle stopped", If(depth > MaxDepth, "Depth limit reached", "Path limit reached"))
+                html.AppendLine("<li class='warning'>" & H(reason) & " before " & H(name) & "; this branch is incomplete.</li>")
+                Return
+            End If
+            state.Count += 1
+            state.Path.Add(name)
+            Dim children As List(Of PreviewEdge) = Nothing
+            Dim hasChildren As Boolean = graph.TryGetValue(name, children) AndAlso children.Count > 0
+            html.Append("<li class='node'>")
+            If hasChildren Then html.Append("<details" & If(depth <= 1, " open", "") & "><summary>") Else html.Append("<div class='leaf'>")
+            html.Append("<span class='name'>" & H(name) & "</span>")
+            If isProposed AndAlso reverseMap.ContainsKey(name) Then
+                html.Append("<span class='badge new'>New member</span>")
+            ElseIf isProposed AndAlso incoming IsNot Nothing Then
+                html.Append("<span class='badge reuse'>Reused</span>")
             Else
-                Dim s As String = Convert.ToString(value, CultureInfo.InvariantCulture)
-                CheckText(s, "Cell " & address)
-                cellNode.Add(New XAttribute("t", "inlineStr"), New XElement(MainNs + "is", New XElement(MainNs + "t", New XAttribute(XNamespace.Xml + "space", "preserve"), s)))
+                html.Append("<span class='badge existing'>Existing</span>")
             End If
-            Return cellNode
+            If incoming IsNot Nothing Then html.Append("<span class='weight'>Weight: " & H(incoming.Weight) & "</span>")
+            html.AppendLine(If(hasChildren, "</summary>", "</div>"))
+            html.Append("<div class='node-meta'>")
+            Dim member As PreviewMember = Nothing
+            If members.TryGetValue(name, member) Then
+                If Not String.IsNullOrEmpty(member.Description) Then html.Append("<div class='description'>" & H(member.Description) & "</div>")
+                html.Append("<div class='meta'>Member dimension: " & H(member.Owner) & "</div>")
+            Else
+                html.Append("<div class='meta'>Member definition not present in these files</div>")
+            End If
+            If reverseMap.ContainsKey(name) Then html.Append("<div class='meta'>Cloned from: " & H(reverseMap(name)) & "</div>")
+            If incoming IsNot Nothing Then html.Append("<div class='meta'>Relationship dimension: " & H(incoming.Owner) & "</div>")
+            html.AppendLine("</div>")
+            If hasChildren Then
+                html.AppendLine("<ul class='branch'>")
+                For Each edge As PreviewEdge In children
+                    If state.Count >= MaxPathsPerPane Then
+                        state.Incomplete = True
+                        html.AppendLine("<li class='warning'>Path limit reached; remaining child paths in this branch are omitted.</li>")
+                        Exit For
+                    End If
+                    AppendNode(html, edge.Child, edge, graph, members, reverseMap, isProposed, state, depth + 1)
+                Next
+                html.AppendLine("</ul></details>")
+            End If
+            html.AppendLine("</li>")
+            state.Path.Remove(name)
+        End Sub
+
+        Private Shared Function HasAttachment(ByVal graph As Dictionary(Of String, List(Of PreviewEdge)),
+            ByVal parent As String, ByVal child As String) As Boolean
+            Return graph.ContainsKey(parent) AndAlso graph(parent).Any(Function(e) CI.Equals(e.Child, child))
         End Function
 
-        Private Shared Function ColumnName(ByVal number As Integer) As String
-            Dim result As String = ""
-            While number > 0
-                number -= 1
-                result = ChrW(65 + (number Mod 26)) & result
-                number = number \ 26
-            End While
+        Private Shared Function DimensionIndex(ByVal doc As XDocument) As Dictionary(Of String, XElement)
+            Dim result As New Dictionary(Of String, XElement)(CI)
+            For Each node As XElement In doc.Descendants("dimension")
+                If CI.Equals(CStr(node.Attribute("type")), "Account") Then result(CStr(node.Attribute("name"))) = node
+            Next
             Return result
         End Function
 
-        Private Shared Function Worksheet(ByVal sheet As ReviewSheet) As XDocument
-            Dim cols As Integer = 1
-            For Each row As Object() In sheet.Rows
-                If row IsNot Nothing Then cols = Math.Max(cols, row.Length)
-            Next
-            Dim data As New XElement(MainNs + "sheetData")
-            For r As Integer = 0 To sheet.Rows.Count - 1
-                Dim values As Object() = sheet.Rows(r)
-                Dim row As New XElement(MainNs + "row", New XAttribute("r", r + 1),
-                    New XAttribute("ht", RowHeight(sheet, values, r, cols).ToString(CultureInfo.InvariantCulture)),
-                    New XAttribute("customHeight", "1"))
-                Dim style As Integer = If(r = 0, 1, If(r = 1, 2, If(r + 1 = sheet.HeaderRow, 3, If((r Mod 2) = 0, 4, 0))))
-                For c As Integer = 0 To cols - 1
-                    Dim value As Object = If(values IsNot Nothing AndAlso c < values.Length, values(c), Nothing)
-                    row.Add(Cell(value, ColumnName(c + 1) & (r + 1).ToString(CultureInfo.InvariantCulture), style))
+        Private Shared Function MemberIndex(ByVal dims As Dictionary(Of String, XElement)) As Dictionary(Of String, PreviewMember)
+            Dim result As New Dictionary(Of String, PreviewMember)(CI)
+            For Each dimEntry As KeyValuePair(Of String, XElement) In dims
+                Dim section As XElement = dimEntry.Value.Element("members")
+                If section Is Nothing Then Continue For
+                For Each node As XElement In section.Elements("member")
+                    Dim info As New PreviewMember With {.Owner = dimEntry.Key, .Description = CStr(node.Attribute("description"))}
+                    If String.IsNullOrEmpty(info.Description) Then
+                        Dim descriptions As List(Of XElement) = node.Descendants("description").ToList()
+                        Dim description As XElement = descriptions.FirstOrDefault(Function(d) CI.Equals(CStr(d.Attribute("culture")), "en-US"))
+                        If description Is Nothing Then description = descriptions.FirstOrDefault()
+                        If description IsNot Nothing Then info.Description = If(CStr(description.Attribute("value")), description.Value)
+                    End If
+                    result(CStr(node.Attribute("name"))) = info
                 Next
-                data.Add(row)
             Next
-            Dim root As New XElement(MainNs + "worksheet")
-            Dim view As New XElement(MainNs + "sheetView", New XAttribute("workbookViewId", "0"), New XAttribute("showGridLines", "0"))
-            If sheet.FreezeRows > 0 OrElse sheet.FreezeColumns > 0 Then
-                Dim topLeft As String = ColumnName(sheet.FreezeColumns + 1) & (sheet.FreezeRows + 1).ToString()
-                Dim activePane As String = If(sheet.FreezeRows > 0, If(sheet.FreezeColumns > 0, "bottomRight", "bottomLeft"), "topRight")
-                Dim pane As New XElement(MainNs + "pane", New XAttribute("topLeftCell", topLeft), New XAttribute("activePane", activePane), New XAttribute("state", "frozen"))
-                If sheet.FreezeColumns > 0 Then pane.Add(New XAttribute("xSplit", sheet.FreezeColumns))
-                If sheet.FreezeRows > 0 Then pane.Add(New XAttribute("ySplit", sheet.FreezeRows))
-                view.Add(pane, New XElement(MainNs + "selection", New XAttribute("pane", activePane), New XAttribute("activeCell", topLeft), New XAttribute("sqref", topLeft)))
-            End If
-            root.Add(New XElement(MainNs + "sheetViews", view))
-            Dim columns As New XElement(MainNs + "cols")
-            For c As Integer = 0 To cols - 1
-                Dim width As Double = If(sheet.Widths IsNot Nothing AndAlso c < sheet.Widths.Length, sheet.Widths(c), 22.0R)
-                columns.Add(New XElement(MainNs + "col", New XAttribute("min", c + 1), New XAttribute("max", c + 1), New XAttribute("width", width.ToString(CultureInfo.InvariantCulture)), New XAttribute("customWidth", "1")))
-            Next
-            root.Add(columns, data)
-            If sheet.HeaderRow > 0 AndAlso sheet.Rows.Count >= sheet.HeaderRow Then
-                root.Add(New XElement(MainNs + "autoFilter", New XAttribute("ref", "A" & sheet.HeaderRow.ToString() & ":" & ColumnName(cols) & sheet.Rows.Count.ToString())))
-            End If
-            If cols > 1 AndAlso sheet.Rows.Count > 0 Then
-                Dim merges As New XElement(MainNs + "mergeCells")
-                If CanMerge(sheet.Rows(0)) Then merges.Add(New XElement(MainNs + "mergeCell", New XAttribute("ref", "A1:" & ColumnName(cols) & "1")))
-                If sheet.Rows.Count > 1 AndAlso CanMerge(sheet.Rows(1)) Then merges.Add(New XElement(MainNs + "mergeCell", New XAttribute("ref", "A2:" & ColumnName(cols) & "2")))
-                If merges.HasElements Then
-                    merges.SetAttributeValue("count", merges.Elements().Count())
-                    root.Add(merges)
-                End If
-            End If
-            Return New XDocument(New XDeclaration("1.0", "utf-8", "yes"), root)
+            Return result
         End Function
 
-        Private Shared Function CanMerge(ByVal values As Object()) As Boolean
-            If values Is Nothing Then Return True
-            For c As Integer = 1 To values.Length - 1
-                If values(c) IsNot Nothing AndAlso Not Convert.IsDBNull(values(c)) AndAlso
-                   Convert.ToString(values(c), CultureInfo.InvariantCulture).Length > 0 Then Return False
-            Next
-            Return True
-        End Function
-
-        Private Shared Function RowHeight(ByVal sheet As ReviewSheet, ByVal values As Object(), ByVal rowIndex As Integer, ByVal columnCount As Integer) As Double
-            If rowIndex = 0 Then Return 30.0R
-            If rowIndex = 1 Then Return 42.0R
-            If rowIndex + 1 = sheet.HeaderRow Then Return 36.0R
-            If values Is Nothing OrElse values.Length = 0 Then Return 20.0R
-            Dim maxLines As Integer = 1
-            For c As Integer = 0 To Math.Min(values.Length, columnCount) - 1
-                If values(c) Is Nothing OrElse Convert.IsDBNull(values(c)) Then Continue For
-                Dim value As String = Convert.ToString(values(c), CultureInfo.InvariantCulture)
-                Dim width As Double = If(sheet.Widths IsNot Nothing AndAlso c < sheet.Widths.Length, sheet.Widths(c), 22.0R)
-                Dim charsPerLine As Integer = Math.Max(1, CInt(Math.Floor(width * 0.9R)))
-                Dim lines As Integer = 0
-                For Each segment As String In value.Split(ChrW(10))
-                    lines += Math.Max(1, CInt(Math.Ceiling(CDbl(segment.Length) / charsPerLine)))
-                    If lines >= 8 Then Exit For
+        Private Shared Sub AddDimensionEdges(ByVal dims As Dictionary(Of String, XElement),
+            ByVal dimName As String, ByVal graph As Dictionary(Of String, List(Of PreviewEdge)))
+            If Not dims.ContainsKey(dimName) Then Return
+            Dim section As XElement = dims(dimName).Element("relationships")
+            If section Is Nothing Then Return
+            For Each node As XElement In section.Elements("relationship")
+                Dim parent As String = CStr(node.Attribute("parent"))
+                Dim child As String = CStr(node.Attribute("child"))
+                If String.IsNullOrEmpty(parent) OrElse String.IsNullOrEmpty(child) Then Continue For
+                Dim weight As String = CStr(node.Attribute("aggregationWeight"))
+                If String.IsNullOrEmpty(weight) Then weight = "not exported (no default assumed)"
+                Dim varying As New List(Of String)
+                For Each prop As XElement In node.Descendants("property")
+                    If Not CI.Equals(CStr(prop.Attribute("name")), "Weight") AndAlso Not CI.Equals(CStr(prop.Attribute("name")), "AggregationWeight") Then Continue For
+                    Dim qualifiers As String = String.Join(", ", prop.Attributes().Where(Function(a) a.Name.LocalName <> "name" AndAlso a.Name.LocalName <> "value").Select(Function(a) a.Name.LocalName & "=" & a.Value).ToArray())
+                    varying.Add(If(CStr(prop.Attribute("value")), "") & If(qualifiers.Length = 0, "", " [" & qualifiers & "]"))
                 Next
-                maxLines = Math.Max(maxLines, Math.Min(lines, 8))
+                If varying.Count > 0 Then weight &= "; varying: " & String.Join("; ", varying.ToArray())
+                If Not graph.ContainsKey(parent) Then graph.Add(parent, New List(Of PreviewEdge))
+                graph(parent).Add(New PreviewEdge With {.Child = child, .Owner = dimName, .Weight = weight})
             Next
-            Return Math.Min(120.0R, Math.Max(20.0R, maxLines * 15.0R + 4.0R))
-        End Function
-
-        Private Shared Function Workbook(ByVal sheets As List(Of ReviewSheet)) As XDocument
-            Dim container As New XElement(MainNs + "sheets")
-            For i As Integer = 0 To sheets.Count - 1
-                container.Add(New XElement(MainNs + "sheet", New XAttribute("name", sheets(i).Name), New XAttribute("sheetId", i + 1), New XAttribute(RelNs + "id", "rId" & (i + 1).ToString())))
-            Next
-            Return New XDocument(New XDeclaration("1.0", "utf-8", "yes"), New XElement(MainNs + "workbook", New XAttribute(XNamespace.Xmlns + "r", RelNs.NamespaceName), New XElement(MainNs + "bookViews", New XElement(MainNs + "workbookView")), container))
-        End Function
-
-        Private Shared Function WorkbookRelationships(ByVal count As Integer) As XDocument
-            Dim root As New XElement(PackageNs + "Relationships")
-            For i As Integer = 1 To count
-                root.Add(New XElement(PackageNs + "Relationship", New XAttribute("Id", "rId" & i.ToString()), New XAttribute("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"), New XAttribute("Target", "worksheets/sheet" & i.ToString() & ".xml")))
-            Next
-            root.Add(New XElement(PackageNs + "Relationship", New XAttribute("Id", "rId" & (count + 1).ToString()), New XAttribute("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles"), New XAttribute("Target", "styles.xml")))
-            Return New XDocument(New XDeclaration("1.0", "utf-8", "yes"), root)
-        End Function
-
-        Private Shared Function ContentTypes(ByVal count As Integer) As XDocument
-            Dim root As New XElement(TypesNs + "Types",
-                New XElement(TypesNs + "Default", New XAttribute("Extension", "rels"), New XAttribute("ContentType", "application/vnd.openxmlformats-package.relationships+xml")),
-                New XElement(TypesNs + "Default", New XAttribute("Extension", "xml"), New XAttribute("ContentType", "application/xml")),
-                New XElement(TypesNs + "Override", New XAttribute("PartName", "/xl/workbook.xml"), New XAttribute("ContentType", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml")),
-                New XElement(TypesNs + "Override", New XAttribute("PartName", "/xl/styles.xml"), New XAttribute("ContentType", "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml")))
-            For i As Integer = 1 To count
-                root.Add(New XElement(TypesNs + "Override", New XAttribute("PartName", "/xl/worksheets/sheet" & i.ToString() & ".xml"), New XAttribute("ContentType", "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml")))
-            Next
-            Return New XDocument(New XDeclaration("1.0", "utf-8", "yes"), root)
-        End Function
-
-        Private Shared Function Styles() As XDocument
-            Dim xml As String = "<styleSheet xmlns='http://schemas.openxmlformats.org/spreadsheetml/2006/main'>" &
-                "<fonts count='3'><font><sz val='11'/><name val='Arial'/></font><font><b/><sz val='11'/><color rgb='FFFFFFFF'/><name val='Arial'/></font><font><b/><sz val='14'/><color rgb='FF17365D'/><name val='Arial'/></font></fonts>" &
-                "<fills count='5'><fill><patternFill patternType='none'/></fill><fill><patternFill patternType='gray125'/></fill><fill><patternFill patternType='solid'><fgColor rgb='FF17365D'/><bgColor indexed='64'/></patternFill></fill><fill><patternFill patternType='solid'><fgColor rgb='FFDCEAF7'/><bgColor indexed='64'/></patternFill></fill><fill><patternFill patternType='solid'><fgColor rgb='FFF2F6FA'/><bgColor indexed='64'/></patternFill></fill></fills>" &
-                "<borders count='1'><border><left/><right/><top/><bottom/><diagonal/></border></borders>" &
-                "<cellStyleXfs count='1'><xf numFmtId='0' fontId='0' fillId='0' borderId='0'/></cellStyleXfs>" &
-                "<cellXfs count='7'><xf numFmtId='0' fontId='0' fillId='0' borderId='0' xfId='0' applyAlignment='1'><alignment vertical='top' wrapText='1'/></xf>" &
-                "<xf numFmtId='0' fontId='2' fillId='0' borderId='0' xfId='0' applyFont='1' applyAlignment='1'><alignment vertical='top' wrapText='1'/></xf>" &
-                "<xf numFmtId='0' fontId='0' fillId='0' borderId='0' xfId='0' applyAlignment='1'><alignment vertical='top' wrapText='1'/></xf>" &
-                "<xf numFmtId='0' fontId='1' fillId='2' borderId='0' xfId='0' applyFont='1' applyFill='1' applyAlignment='1'><alignment horizontal='center' vertical='center' wrapText='1'/></xf>" &
-                "<xf numFmtId='0' fontId='0' fillId='4' borderId='0' xfId='0' applyFill='1' applyAlignment='1'><alignment vertical='top' wrapText='1'/></xf>" &
-                "<xf numFmtId='49' fontId='0' fillId='0' borderId='0' xfId='0' applyNumberFormat='1' applyAlignment='1'><alignment vertical='top' wrapText='1'/></xf>" &
-                "<xf numFmtId='49' fontId='0' fillId='4' borderId='0' xfId='0' applyNumberFormat='1' applyFill='1' applyAlignment='1'><alignment vertical='top' wrapText='1'/></xf></cellXfs>" &
-                "<cellStyles count='1'><cellStyle name='Normal' xfId='0' builtinId='0'/></cellStyles></styleSheet>"
-            Return XDocument.Parse(xml)
-        End Function
-
-        Private Shared Sub Put(ByVal zip As System.IO.Compression.ZipArchive, ByVal name As String, ByVal document As XDocument)
-            Dim entry As System.IO.Compression.ZipArchiveEntry = zip.CreateEntry(name, System.IO.Compression.CompressionLevel.Optimal)
-            Using stream As Stream = entry.Open()
-                Using writer As New StreamWriter(stream, New UTF8Encoding(False))
-                    document.Save(writer, SaveOptions.DisableFormatting)
-                End Using
-            End Using
         End Sub
+
+        Private Shared Function H(ByVal value As String) As String
+            Return System.Net.WebUtility.HtmlEncode(If(value, ""))
+        End Function
     End Class
 End Namespace
